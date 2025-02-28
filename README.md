@@ -47,6 +47,7 @@ By using Paper-Check, you can follow these academic writing principles:
 ## 4. Usage
 
 ```bash
+export XAI_API_KEY=xxx
 python paper_check.py --pdf path/to/your/paper.pdf --latex path/to/your/latex/source
 ```
 
