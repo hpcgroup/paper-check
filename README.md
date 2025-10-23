@@ -44,7 +44,15 @@ By using Paper-Check, you can follow these academic writing principles:
 - **Completeness**: Each section should comprehensively cover necessary content without key omissions
 - **Citation Standards**: Correctly cite references and related work
 
-## 4. Usage
+## 4. Required Setup
+
+```bash
+pip install -r requirements.txt
+```
+
+`poppler` is a required program for `pdf2image`. For more information see [pdf2img pypi page](https://pypi.org/project/pdf2image/). 
+
+## 5. Usage
 
 ```bash
 export XAI_API_KEY=xxx
