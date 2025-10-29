@@ -12,10 +12,13 @@ DEBUG = False
 class ChecklistEvaluator:
     def __init__(self, pdf_path, latex_path_or_dir, openai_api_key=None):
         self.pdf_path = pdf_path
+        self.file_text_map = {}
         if os.path.isdir(latex_path_or_dir):
             # Prioritize loading 'paper.tex' and process \input commands to include corresponding files
-            self.latex_text = self.load_latex_dir(latex_path_or_dir)
+            self.latex_root_dir = os.path.abspath(latex_path_or_dir)
+            self.latex_text = self.load_latex_dir(self.latex_root_dir)
         else:
+            self.latex_root_dir = os.path.abspath(os.path.dirname(latex_path_or_dir))
             self.latex_text = self.load_latex_file(latex_path_or_dir)
         # Extract sections from the merged LaTeX text
         self.sections = self.extract_sections(self.latex_text)
@@ -23,6 +26,33 @@ class ChecklistEvaluator:
         if openai_api_key:
             os.environ["XAI_API_KEY"] = openai_api_key
         self.report = {}
+
+    @staticmethod
+    def _remove_comment_only_lines(text):
+        """Strip lines that are purely LaTeX comments (starting with %)"""
+        return ''.join(
+            line for line in text.splitlines(keepends=True)
+            if not line.lstrip().startswith('%')
+        )
+
+    def _register_file_text(self, file_path, content):
+        """Record comment-stripped LaTeX content for per-file static checks."""
+        abs_path = os.path.abspath(file_path)
+        try:
+            rel_path = os.path.relpath(abs_path, self.latex_root_dir)
+        except ValueError:
+            # Fallback for different drives or missing root
+            rel_path = os.path.basename(abs_path)
+        self.file_text_map[rel_path] = content
+        return rel_path
+
+    def _iterate_latex_files(self):
+        """Yield (relative_path, content) pairs for each processed LaTeX source."""
+        if self.file_text_map:
+            for path in sorted(self.file_text_map.keys()):
+                yield path, self.file_text_map[path]
+        else:
+            yield "document.tex", self.latex_text
 
     def load_pdf(self):
         """Extract text from PDF"""
@@ -37,7 +67,10 @@ class ChecklistEvaluator:
     def load_latex_file(self, file_path):
         """Load a single LaTeX file"""
         with open(file_path, 'r', encoding='utf-8') as f:
-            return f.read()
+            original_content = f.read()
+        content_no_comments = self._remove_comment_only_lines(original_content)
+        self._register_file_text(file_path, content_no_comments)
+        return content_no_comments
 
     def load_latex_dir(self, directory):
         """
@@ -71,11 +104,11 @@ class ChecklistEvaluator:
             
             try:
                 with open(file_path, 'r', encoding='utf-8') as f:
-                    content_lines = f.readlines()
-                
+                    original_content = f.read()
+
                 # Remove all comment lines starting with %
-                non_comment_lines = [line for line in content_lines if not line.lstrip().startswith('%')]
-                content = ''.join(non_comment_lines)
+                content = self._remove_comment_only_lines(original_content)
+                self._register_file_text(file_path, content)
                 # print(f"  Removed {len(content_lines) - len(non_comment_lines)} comment lines from file {file_path}")
                 
             except Exception as e:
@@ -467,199 +500,145 @@ class ChecklistEvaluator:
         self.report['section_buffer'] = result
         return (len(issues) == 0)
 
-    def static_check_figures(self):
-        """Figure static check: verify [h] placement, captions, labels and references (ignoring commented lines)"""
-        non_commented_text = "\n".join(
-            line for line in self.latex_text.splitlines() if not line.lstrip().startswith("%")
-        )
-        
-        # Use more powerful regex to match all figure environments
-        figures_with_options = re.findall(r'\\begin\{figure\}\[([^\]]+)\](.*?)\\end\{figure\}', non_commented_text, re.DOTALL)
-        figures_without_options = re.findall(r'\\begin\{figure\}(?!\[)(.*?)\\end\{figure\}', non_commented_text, re.DOTALL)
-        
+    def _static_check_figures_in_content(self, rel_path, content, full_text):
+        """Run figure static checks for a single LaTeX source file."""
+        non_commented_text = self._remove_comment_only_lines(content)
+        if not non_commented_text.strip():
+            return [], []
+
         issues = []
-        figure_labels = []
-        figures_without_h = []
-        figures_without_caption = []
-        figures_without_label = []  # New: record figures with captions but missing labels
-        figures_with_label_without_caption = []
-        
-        if DEBUG:
-            print(f"Found {len(figures_with_options)} figures with options and {len(figures_without_options)} figures without options")
-            
-        # Regular expression for handling nested braces
-        # This function can handle nested braces, ensuring correct matching of content like \caption{text {nested} more text}
+        failed_messages = []
+        figure_labels = set()
+
+        def record(message):
+            issues.append(message)
+            failed_messages.append(f"{rel_path}: {message}")
+            if DEBUG:
+                print(f"[FigureCheck][{rel_path}] {message}")
+
         def extract_content_with_braces(text, command):
             pattern = f"{command}" + r"\{((?:[^{}]|(?:\{[^{}]*\}))*)\}"
-            match = re.search(pattern, text, re.DOTALL)
-            return match
-        
+            return re.search(pattern, text, re.DOTALL)
+
+        def preview_text(text, length):
+            snippet = text.strip()
+            return snippet[:length] + ("..." if len(snippet) > length else "")
+
+        figures_with_options = re.findall(r'\\begin\{figure\}\[([^\]]+)\](.*?)\\end\{figure\}', non_commented_text, re.DOTALL)
+        figures_without_options = re.findall(r'\\begin\{figure\}(?!\[)(.*?)\\end\{figure\}', non_commented_text, re.DOTALL)
+
+        if DEBUG:
+            print(f"Found {len(figures_with_options)} figures with options and {len(figures_without_options)} figures without options in {rel_path}")
+
         # Process figures with options
-        for i, (placement, content) in enumerate(figures_with_options):
-            if DEBUG:
-                print(f"\nChecking figure with options #{i+1}, options: [{placement}]")
-                
-            # Check if it includes [h] placement option
+        for placement, content_block in figures_with_options:
+            caption_match = extract_content_with_braces(content_block, r"\\caption")
+            caption_text = caption_match.group(1) if caption_match else ""
+            caption_preview_short = preview_text(caption_text or "Figure without caption", 30)
+
             if 'h' not in placement:
-                # Report issues using caption content (not label)
-                caption_match = extract_content_with_braces(content, r"\\caption")
-                caption_text = caption_match.group(1) if caption_match else "Figure without caption"
-                issues.append(f"Figure missing [h] placement option: '{caption_text[:30]}...'")
-                figures_without_h.append(caption_text[:50] + ("..." if len(caption_text) > 50 else ""))
-                if DEBUG:
-                    print(f"  Missing [h] option, caption: {caption_text[:30]}...")
-            
-            # Check if it has a caption
-            caption_match = extract_content_with_braces(content, r"\\caption")
+                record(f"Figure missing [h] placement option: '{caption_preview_short}'")
+
             if not caption_match:
-                issues.append("Figure missing caption")
-                figures_without_caption.append(f"Figure with options [{placement}]")
-                if DEBUG:
-                    print("  Missing caption")
-            else:
-                caption_text = caption_match.group(1)
-                if DEBUG:
-                    print(f"  Caption: {caption_text[:30]}...")
-            
-            # Check label
-            label_match = extract_content_with_braces(content, r"\\label")
+                record(f"Figure missing caption (options: [{placement}])")
+
+            label_match = extract_content_with_braces(content_block, r"\\label")
             if label_match:
                 label_text = label_match.group(1)
-                figure_labels.append(label_text)
-                if DEBUG:
-                    print(f"  Label: {label_text}")
-                
-                # Check if label is after the caption
-                if caption_match:
-                    # Use the start position of regex groups to determine relative positions
-                    caption_start = caption_match.start()
-                    label_start = label_match.start()
-                    
-                    if label_start < caption_start:
-                        issues.append(f"Figure label '{label_text}' should be placed after the caption")
-                        if DEBUG:
-                            print(f"  Label position error: before caption")
-                else:
-                    issues.append(f"Figure label '{label_text}' exists but has no associated caption")
-                    figures_with_label_without_caption.append(label_text)
-                    if DEBUG:
-                        print(f"  Has label but no caption")
-            # New: Check for figures with captions but missing labels
+                figure_labels.add(label_text)
+                if caption_match and label_match.start() < caption_match.start():
+                    record(f"Figure label '{label_text}' should be placed after the caption")
+                if not caption_match:
+                    record(f"Figure label '{label_text}' exists but has no associated caption")
             elif caption_match:
-                caption_text = caption_match.group(1)
-                issues.append(f"Figure has caption but missing label: '{caption_text[:30]}...'")
-                figures_without_label.append(caption_text[:50] + ("..." if len(caption_text) > 50 else ""))
-                if DEBUG:
-                    print(f"  Has caption but missing label: {caption_text[:30]}...")
-        
+                record(f"Figure has caption but missing label: '{caption_preview_short}'")
+
         # Process figures without options
-        for i, content in enumerate(figures_without_options):
-            if DEBUG:
-                print(f"\nChecking figure without options #{i+1}")
-                
-            # These figures are missing [h] placement option by default
-            caption_match = extract_content_with_braces(content, r"\\caption")
-            caption_text = caption_match.group(1) if caption_match else "Figure without caption"
-            
-            issues.append(f"Figure missing [h] placement option: '{caption_text[:30]}...'")
-            figures_without_h.append(caption_text[:50] + ("..." if len(caption_text) > 50 else ""))
-            if DEBUG:
-                print(f"  Missing [h] option, caption: {caption_text[:30]}...")
-            
-            # Check if it has a caption
+        for content_block in figures_without_options:
+            caption_match = extract_content_with_braces(content_block, r"\\caption")
+            caption_text = caption_match.group(1) if caption_match else ""
+            caption_preview_short = preview_text(caption_text or "Figure without caption", 30)
+
+            record(f"Figure missing [h] placement option: '{caption_preview_short}'")
+
             if not caption_match:
-                issues.append("Figure missing caption")
-                figures_without_caption.append("Figure without placement options")
-                if DEBUG:
-                    print("  Missing caption")
-            else:
-                if DEBUG:
-                    print(f"  Caption: {caption_text[:30]}...")
-            
-            # Check label
-            label_match = extract_content_with_braces(content, r"\\label")
+                record("Figure missing caption (no placement options)")
+
+            label_match = extract_content_with_braces(content_block, r"\\label")
             if label_match:
                 label_text = label_match.group(1)
-                figure_labels.append(label_text)
-                if DEBUG:
-                    print(f"  Label: {label_text}")
-                
-                # Check if label is after the caption
-                if caption_match:
-                    # Use the start position of regex groups to determine relative positions
-                    caption_start = caption_match.start()
-                    label_start = label_match.start()
-                    
-                    if label_start < caption_start:
-                        issues.append(f"Figure label '{label_text}' should be placed after the caption")
-                        if DEBUG:
-                            print(f"  Label position error: before caption")
-                else:
-                    issues.append(f"Figure label '{label_text}' exists but has no associated caption")
-                    figures_with_label_without_caption.append(label_text)
-                    if DEBUG:
-                        print(f"  Has label but no caption")
-            # New: Check for figures with captions but missing labels
+                figure_labels.add(label_text)
+                if caption_match and label_match.start() < caption_match.start():
+                    record(f"Figure label '{label_text}' should be placed after the caption")
+                if not caption_match:
+                    record(f"Figure label '{label_text}' exists but has no associated caption")
             elif caption_match:
-                caption_text = caption_match.group(1)
-                issues.append(f"Figure has caption but missing label: '{caption_text[:30]}...'")
-                figures_without_label.append(caption_text[:50] + ("..." if len(caption_text) > 50 else ""))
-                if DEBUG:
-                    print(f"  Has caption but missing label: {caption_text[:30]}...")
-                
-        # Check label references
-        unreferenced_labels = []
+                record(f"Figure has caption but missing label: '{caption_preview_short}'")
+
+        # Check label references using the full merged LaTeX text
+        full_text_clean = self._remove_comment_only_lines(full_text)
         for label in figure_labels:
-            # Check various reference formats: \ref, \autoref, \cref, \Cref
-            if not (re.search(r'\\ref\{' + re.escape(label) + r'\}', non_commented_text) or
-                    re.search(r'\\autoref\{' + re.escape(label) + r'\}', non_commented_text) or
-                    re.search(r'\\cref\{' + re.escape(label) + r'\}', non_commented_text) or
-                    re.search(r'\\Cref\{' + re.escape(label) + r'\}', non_commented_text)):
-                issues.append(f"Figure label '{label}' is not referenced in the text.")
-                unreferenced_labels.append(label)
-                if DEBUG:
-                    print(f"Label '{label}' is not referenced")
-                
+            if not self._is_label_referenced(label, full_text_clean):
+                record(f"Figure label '{label}' is not referenced in the text.")
+
+        return issues, failed_messages
+
+    @staticmethod
+    def _is_label_referenced(label, text):
+        """Check if a figure label is referenced anywhere in the LaTeX text."""
+        patterns = [
+            rf'\\ref\{{{re.escape(label)}\}}',
+            rf'\\autoref\{{{re.escape(label)}\}}',
+            rf'\\cref\{{{re.escape(label)}\}}',
+            rf'\\Cref\{{{re.escape(label)}\}}'
+        ]
+        return any(re.search(pattern, text) for pattern in patterns)
+
+    def static_check_figures(self):
+        """Figure static check: verify [h] placement, captions, labels and references per source file."""
+        issues = []
+        failed_messages = []
+        full_text = self.latex_text
+
+        for rel_path, content in self._iterate_latex_files():
+            file_issues, file_failed_messages = self._static_check_figures_in_content(rel_path, content, full_text)
+            issues.extend(file_issues)
+            failed_messages.extend(file_failed_messages)
+
         result = {
             'check': 'Figure Static Check',
             'result': (len(issues) == 0),
             'detail': issues if issues else "All figures passed static checks.",
-            'failed_content': {
-                'figures_without_h': figures_without_h,
-                'figures_without_caption': figures_without_caption,
-                'figures_without_label': figures_without_label,  # New: figures with captions but missing labels
-                'figures_with_label_without_caption': figures_with_label_without_caption,
-                'unreferenced_labels': unreferenced_labels
-            } if issues else None
+            'failed_content': failed_messages if failed_messages else None
         }
         self.report['figures_static'] = result
         return issues
 
     def static_check_numbers_spelling(self):
-        """Check if numbers less than 10 appearing alone are spelled out as words"""
+        """Check if numbers less than 10 appearing alone are spelled out as words, per source file."""
         issues = []
-        # Modified regex to ensure numbers are preceded and followed by whitespace or line start/end
-        # (?<!\S) means not preceded by a non-whitespace character (i.e., preceded by whitespace or line start)
-        # (?!\S) means not followed by a non-whitespace character (i.e., followed by whitespace or line end)
+        failed_messages = []
         pattern = r'(?<!\S)([1-9])(?!\S)'
-        numbers_found = re.findall(pattern, self.latex_text)
-        
-        if numbers_found:
-            digit_matches = []
-            # Get numbers and their context
-            for match in re.finditer(pattern, self.latex_text):
+
+        for rel_path, content in self._iterate_latex_files():
+            matches = list(re.finditer(pattern, content))
+            if not matches:
+                continue
+
+            digits_in_file = sorted({match.group(1) for match in matches})
+            issues.append(f"{rel_path}: Found standalone numeric digits: {', '.join(digits_in_file)}. Consider spelling them out.")
+
+            for match in matches:
                 start = max(0, match.start() - 30)
-                end = min(len(self.latex_text), match.end() + 30)
-                context = self.latex_text[start:end]
-                digit_matches.append(f"Number '{match.group(0)}' appears in: '...{context}...'")
-            
-            issues.append(f"Found standalone numeric digits: {set(numbers_found)}. Consider spelling them out.")
-            
+                end = min(len(content), match.end() + 30)
+                context = content[start:end]
+                failed_messages.append(f"{rel_path}: Number '{match.group(0)}' appears in: '...{context}...'")
+
         result = {
             'check': 'Number Spelling Check',
             'result': (len(issues) == 0),
             'detail': issues if issues else "All numbers are properly spelled out or not standalone.",
-            'failed_content': digit_matches if 'digit_matches' in locals() and digit_matches else None
+            'failed_content': failed_messages if failed_messages else None
         }
         self.report['numbers_spelling'] = result
         return issues
@@ -672,25 +651,27 @@ class ChecklistEvaluator:
             "like": "such as"
         }
         issues = []
-        informal_instances = {}
-        
-        for word in informal_words:
-            instances = []
-            for match in re.finditer(r'\b' + re.escape(word) + r'\b', self.latex_text, re.IGNORECASE):
-                start = max(0, match.start() - 30)
-                end = min(len(self.latex_text), match.end() + 30)
-                context = self.latex_text[start:end]
-                instances.append(f"'...{context}...'")
-                
-            if instances:
-                issues.append(f"Found informal word '{word}'. Consider replacing with '{informal_words[word]}'.")
-                informal_instances[word] = instances
-                
+        failed_messages = []
+
+        for rel_path, content in self._iterate_latex_files():
+            for word, suggestion in informal_words.items():
+                matches = list(re.finditer(r'\b' + re.escape(word) + r'\b', content, re.IGNORECASE))
+                if not matches:
+                    continue
+
+                issues.append(f"{rel_path}: Found informal word '{word}'. Consider replacing with '{suggestion}'.")
+
+                for match in matches:
+                    start = max(0, match.start() - 30)
+                    end = min(len(content), match.end() + 30)
+                    context = content[start:end]
+                    failed_messages.append(f"{rel_path}: Found informal word '{word}' in context '...{context}...'")
+
         result = {
             'check': 'Informal Word Usage',
             'result': (len(issues) == 0),
             'detail': issues if issues else "No informal words detected.",
-            'failed_content': informal_instances if informal_instances else None
+            'failed_content': failed_messages if failed_messages else None
         }
         self.report['informal_words'] = result
         return issues
@@ -1031,4 +1012,4 @@ def main():
 
     print(f"\n\033[32mMarkdown report saved to: {report_filename}\033[0m")
 if __name__ == "__main__":
-    main() 
+    main()
